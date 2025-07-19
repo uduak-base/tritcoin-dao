@@ -102,3 +102,110 @@
 (define-private (calculate-voting-power (voter principal))
     (default-to u0 (map-get? balances voter))
 )
+
+(define-private (transfer-tokens (sender principal) (recipient principal) (amount uint))
+    (let (
+        (sender-balance (default-to u0 (map-get? balances sender)))
+        (recipient-balance (default-to u0 (map-get? balances recipient)))
+    )
+        (asserts! (>= sender-balance amount) err-insufficient-balance)
+        (map-set balances sender (- sender-balance amount))
+        (map-set balances recipient (+ recipient-balance amount))
+        (ok true)
+    )
+)
+
+(define-private (mint-tokens (account principal) (amount uint))
+    (let (
+        (current-balance (default-to u0 (map-get? balances account)))
+    )
+        (map-set balances account (+ current-balance amount))
+        (var-set total-supply (+ (var-get total-supply) amount))
+        (ok true)
+    )
+)
+
+(define-private (burn-tokens (account principal) (amount uint))
+    (let (
+        (current-balance (default-to u0 (map-get? balances account)))
+    )
+        (asserts! (>= current-balance amount) err-insufficient-balance)
+        (map-set balances account (- current-balance amount))
+        (var-set total-supply (- (var-get total-supply) amount))
+        (ok true)
+    )
+)
+
+;; PROTOCOL INITIALIZATION
+
+(define-public (initialize)
+    (begin
+        (asserts! (is-contract-owner) err-owner-only)
+        (asserts! (not (var-get initialized)) err-already-initialized)
+        (var-set initialized true)
+        (ok true)
+    )
+)
+
+;; TREASURY MANAGEMENT FUNCTIONS
+
+;; Stake STX to gain governance rights (Bitcoin-style time lock)
+(define-public (deposit (amount uint))
+    (begin
+        (try! (check-initialized))
+        (asserts! (>= amount (var-get minimum-deposit)) err-below-minimum)
+        (asserts! (> amount u0) err-zero-amount)
+
+        ;; Transfer STX to treasury contract
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        
+        ;; Record stake with time lock (Bitcoin security model)
+        (map-set deposits tx-sender {
+            amount: amount,
+            lock-until: (+ stacks-block-height (var-get lock-period)),
+            last-reward-block: stacks-block-height
+        })
+        
+        ;; Issue governance tokens proportional to stake
+        (mint-tokens tx-sender amount)
+    )
+)
+
+;; Withdraw staked STX after time lock expires
+(define-public (withdraw (amount uint))
+    (begin
+        (try! (check-initialized))
+        (asserts! (> amount u0) err-zero-amount)
+
+        (let (
+            (deposit-info (unwrap! (map-get? deposits tx-sender) err-unauthorized))
+            (user-balance (unwrap! (get-balance tx-sender) err-unauthorized))
+        )
+            ;; Enforce Bitcoin-style time lock security
+            (asserts! (>= stacks-block-height (get lock-until deposit-info)) err-locked-period)
+            (asserts! (>= user-balance amount) err-insufficient-balance)
+            
+            ;; Burn governance tokens first
+            (try! (burn-tokens tx-sender amount))
+            
+            ;; Return staked STX to user
+            (as-contract (stx-transfer? amount (as-contract tx-sender) tx-sender))
+        )
+    )
+)
+
+;; GOVERNANCE & PROPOSAL SYSTEM
+
+;; Submit proposal for community treasury funding
+(define-public (create-proposal
+    (description (string-ascii 256))
+    (amount uint)
+    (target principal)
+    (duration uint)
+)
+    (begin
+        (try! (check-initialized))
+
+        ;; Comprehensive input validation
+        (asserts! (> (len description) u0) err-invalid-description)
+        (asserts! (> amount u0) err-zero-amount)
