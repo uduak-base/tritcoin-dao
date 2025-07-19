@@ -209,3 +209,115 @@
         ;; Comprehensive input validation
         (asserts! (> (len description) u0) err-invalid-description)
         (asserts! (> amount u0) err-zero-amount)
+        (asserts! (not (is-eq target (as-contract tx-sender))) err-invalid-target)
+        (asserts! (and (>= duration minimum-duration) (<= duration maximum-duration)) err-invalid-duration)
+        
+        (let (
+            (proposer-balance (unwrap! (map-get? balances tx-sender) err-unauthorized))
+            (proposal-id (+ (var-get proposal-count) u1))
+        )
+            ;; Only governance token holders can propose
+            (asserts! (> proposer-balance u0) err-unauthorized)
+            
+            ;; Create proposal with Bitcoin-aligned parameters
+            (map-set proposals proposal-id {
+                proposer: tx-sender,
+                description: description,
+                amount: amount,
+                target: target,
+                expires-at: (+ stacks-block-height duration),
+                executed: false,
+                yes-votes: u0,
+                no-votes: u0
+            })
+            
+            (var-set proposal-count proposal-id)
+            (ok proposal-id)
+        )
+    )
+)
+
+;; Cast weighted vote on active proposal
+(define-public (vote (proposal-id uint) (vote-for bool))
+    (begin
+        (try! (check-initialized))
+        (try! (validate-proposal-id proposal-id))
+
+        (let (
+            (proposal (unwrap! (map-get? proposals proposal-id) err-proposal-not-found))
+            (voter-power (calculate-voting-power tx-sender))
+        )
+            ;; Validate voter eligibility and timing
+            (asserts! (> voter-power u0) err-unauthorized)
+            (asserts! (< stacks-block-height (get expires-at proposal)) err-proposal-expired)
+            (asserts! (is-none (map-get? votes {proposal-id: proposal-id, voter: tx-sender})) err-already-voted)
+            
+            ;; Record vote securely
+            (map-set votes {proposal-id: proposal-id, voter: tx-sender} vote-for)
+            
+            ;; Update weighted vote tallies
+            (map-set proposals proposal-id 
+                (merge proposal 
+                    {
+                        yes-votes: (if vote-for 
+                            (+ (get yes-votes proposal) voter-power)
+                            (get yes-votes proposal)),
+                        no-votes: (if vote-for
+                            (get no-votes proposal)
+                            (+ (get no-votes proposal) voter-power))
+                    }
+                )
+            )
+            
+            (ok true)
+        )
+    )
+)
+
+;; Execute approved proposal and distribute treasury funds
+(define-public (execute-proposal (proposal-id uint))
+    (begin
+        (try! (check-initialized))
+        (try! (validate-proposal-id proposal-id))
+
+        (let (
+            (proposal (unwrap! (map-get? proposals proposal-id) err-proposal-not-found))
+            (contract-balance (stx-get-balance (as-contract tx-sender)))
+        )
+            ;; Validate execution prerequisites
+            (asserts! (not (get executed proposal)) err-unauthorized)
+            (asserts! (>= stacks-block-height (get expires-at proposal)) err-proposal-expired)
+            (asserts! (> (get yes-votes proposal) (get no-votes proposal)) err-unauthorized)
+            (asserts! (>= contract-balance (get amount proposal)) err-insufficient-balance)
+            
+            ;; Execute treasury distribution
+            (try! (as-contract (stx-transfer? (get amount proposal) (as-contract tx-sender) (get target proposal))))
+            
+            ;; Mark proposal as completed
+            (map-set proposals proposal-id (merge proposal {executed: true}))
+            (ok true)
+        )
+    )
+)
+
+;; READ-ONLY QUERY FUNCTIONS
+
+(define-read-only (get-balance (account principal))
+    (ok (default-to u0 (map-get? balances account)))
+)
+
+(define-read-only (get-total-supply)
+    (ok (var-get total-supply))
+)
+
+(define-read-only (get-proposal (proposal-id uint))
+    (ok (map-get? proposals proposal-id))
+)
+
+(define-read-only (get-deposit-info (account principal))
+    (ok (map-get? deposits account))
+)
+
+(define-read-only (get-vote (proposal-id uint) (voter principal))
+    (ok (map-get? votes {proposal-id: proposal-id, voter: voter}))
+)
